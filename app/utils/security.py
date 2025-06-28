@@ -3,6 +3,7 @@ from functools import wraps
 from flask import request, jsonify, current_app
 from werkzeug.utils import secure_filename
 import re
+import os
 
 def require_auth(f):
     """Decorator to require authentication"""
@@ -63,11 +64,20 @@ def validate_filename(filename):
     
     # Check for suspicious patterns
     suspicious_patterns = [
-        r'\.\./', r'\.\.\\', r'^\/', r'^\\'
+        r'\.\./', r'\.\.\\', r'^\/', r'^\\', r'\x00'  # Remove overly restrictive patterns
     ]
     
     for pattern in suspicious_patterns:
         if re.search(pattern, filename):
             raise ValueError("Filename contains suspicious patterns")
     
-    return sanitize_path(filename)
+    # Create a safe filename by replacing problematic characters
+    # Keep original extension
+    name, ext = os.path.splitext(filename)
+    
+    # Replace spaces and special characters with underscores, but keep basic characters
+    import re
+    safe_name = re.sub(r'[^\w\-_\.]', '_', name)
+    safe_filename = f"{safe_name}{ext}"
+    
+    return safe_filename

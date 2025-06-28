@@ -7,11 +7,11 @@ from pathlib import Path
 class FileModel:
     def __init__(self, db):
         self.db = db
-        self.collection = db.files if db else None
+        self.collection = db.files if db is not None else None
     
     def create_file_record(self, device, folder, filename, filepath, metadata=None):
         """Create a new file record in MongoDB"""
-        if not self.collection:
+        if self.collection is None:
             return None
             
         file_stats = Path(filepath).stat()
@@ -39,7 +39,7 @@ class FileModel:
     
     def get_file_by_path(self, device, folder, filename):
         """Get file record by device/folder/filename path"""
-        if not self.collection:
+        if self.collection is None:
             return None
             
         return self.collection.find_one({
@@ -51,7 +51,7 @@ class FileModel:
     
     def get_files_by_device(self, device, folder=None):
         """Get all files for a device, optionally filtered by folder"""
-        if not self.collection:
+        if self.collection is None:
             return []
             
         query = {'device': device, 'is_deleted': False}
@@ -62,7 +62,7 @@ class FileModel:
     
     def update_file_metadata(self, device, folder, filename, updates):
         """Update file metadata"""
-        if not self.collection:
+        if self.collection is None:
             return False
             
         result = self.collection.update_one(
@@ -73,7 +73,7 @@ class FileModel:
     
     def mark_file_deleted(self, device, folder, filename):
         """Mark file as deleted (soft delete)"""
-        if not self.collection:
+        if self.collection is None:
             return False
             
         result = self.collection.update_one(
@@ -84,7 +84,7 @@ class FileModel:
     
     def get_device_stats(self, device):
         """Get statistics for a device"""
-        if not self.collection:
+        if self.collection is None:
             return {'total_files': 0, 'total_size': 0}
             
         pipeline = [
@@ -108,7 +108,7 @@ class FileModel:
     
     def search_files(self, query, device=None, folder=None, limit=50):
         """Search files by filename or metadata"""
-        if not self.collection:
+        if self.collection is None:
             return []
             
         search_filter = {

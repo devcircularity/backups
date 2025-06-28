@@ -11,7 +11,7 @@ def health_check():
     
     # Check MongoDB connection
     mongodb_status = False
-    if current_app.db:
+    if current_app.db is not None:
         try:
             current_app.db.command('ping')
             mongodb_status = True

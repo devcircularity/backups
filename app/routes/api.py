@@ -136,6 +136,7 @@ def list_files(device, folder):
 @limiter.limit("10 per minute")
 def upload_file(device, folder):
     """Upload a file to specified device folder"""
+    filename = None  # Initialize filename variable
     try:
         device = validate_device_type(device)
         folder = sanitize_path(folder)
@@ -196,13 +197,15 @@ def upload_file(device, folder):
         }), 201
         
     except ValueError as e:
-        audit_model.log_action('upload', device, folder, filename, request.remote_addr, False, {'error': str(e)})
+        filename_safe = filename if filename else 'unknown'
+        audit_model.log_action('upload', device, folder, filename_safe, request.remote_addr, False, {'error': str(e)})
         return jsonify({'error': str(e)}), 400
     except RequestEntityTooLarge:
         return jsonify({'error': 'File too large'}), 413
     except Exception as e:
+        filename_safe = filename if filename else 'unknown'
         current_app.logger.error(f"Error uploading file: {str(e)}")
-        audit_model.log_action('upload', device, folder, filename, request.remote_addr, False, {'error': str(e)})
+        audit_model.log_action('upload', device, folder, filename_safe, request.remote_addr, False, {'error': str(e)})
         return jsonify({'error': 'Upload failed'}), 500
 
 @api_bp.route('/devices/<device>/folders/<folder>/files/<filename>')
@@ -275,6 +278,7 @@ def delete_file(device, folder, filename):
 @require_auth
 def create_folder(device):
     """Create a new folder"""
+    folder = None  # Initialize folder variable
     try:
         device = validate_device_type(device)
         audit_model = get_models()[1]
@@ -304,7 +308,8 @@ def create_folder(device):
     except ValueError as e:
         return jsonify({'error': str(e)}), 400
     except Exception as e:
-        current_app.logger.error(f"Error creating folder {device}/{folder}: {str(e)}")
+        folder_name = folder if folder else 'unknown'
+        current_app.logger.error(f"Error creating folder {device}/{folder_name}: {str(e)}")
         return jsonify({'error': 'Failed to create folder'}), 500
 
 @api_bp.route('/devices/<device>/folders/<folder>/files/<filename>/checksum')
