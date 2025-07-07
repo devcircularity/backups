@@ -1,9 +1,10 @@
 # app/routes/api.py
 from flask import Blueprint, request, jsonify, send_file, current_app
 from werkzeug.exceptions import RequestEntityTooLarge
-from app.utils.security import require_auth, sanitize_path, validate_device_type, validate_filename
+from app.utils.security import sanitize_path, validate_device_type, validate_filename
 from app.models.file_model import FileModel
 from app.models.audit_model import AuditModel
+from werkzeug.utils import secure_filename
 from app import limiter
 import os
 from datetime import datetime
@@ -18,7 +19,6 @@ def get_models():
     return file_model, audit_model
 
 @api_bp.route('/devices')
-@require_auth
 def list_devices():
     """List available device types and their folders"""
     try:
@@ -51,9 +51,8 @@ def list_devices():
         return jsonify({'error': 'Failed to list devices'}), 500
 
 @api_bp.route('/devices/<device>/folders')
-@require_auth
 def list_folders(device):
-    """List folders for a specific device"""
+    """List folders for a specific device with nested folder support"""
     try:
         device = validate_device_type(device)
         file_model, audit_model = get_models()
@@ -64,17 +63,55 @@ def list_folders(device):
             return jsonify({'error': f'Device type {device} not found'}), 404
         
         folders = []
+        
+        def get_folder_info(folder_path, relative_path=""):
+            """Recursively get folder information"""
+            folder_info = {
+                'name': folder_path.name,
+                'path': relative_path or folder_path.name,
+                'full_path': str(folder_path.relative_to(device_path)),
+                'is_nested': bool(relative_path),
+                'file_count': 0,
+                'total_size': 0,
+                'subfolders': [],
+                'has_files': False
+            }
+            
+            try:
+                # Count files and get subfolders
+                for item in folder_path.iterdir():
+                    if item.is_file() and not item.name.startswith('.'):
+                        folder_info['file_count'] += 1
+                        folder_info['total_size'] += item.stat().st_size
+                        folder_info['has_files'] = True
+                    elif item.is_dir():
+                        subfolder_info = get_folder_info(
+                            item, 
+                            f"{relative_path}/{item.name}" if relative_path else item.name
+                        )
+                        folder_info['subfolders'].append(subfolder_info)
+                        # Add subfolder stats to parent
+                        folder_info['file_count'] += subfolder_info['file_count']
+                        folder_info['total_size'] += subfolder_info['total_size']
+                
+                # Set last modified time
+                try:
+                    folder_info['last_modified'] = datetime.fromtimestamp(
+                        folder_path.stat().st_mtime
+                    ).isoformat()
+                except:
+                    folder_info['last_modified'] = None
+                    
+            except PermissionError:
+                current_app.logger.warning(f"Permission denied accessing {folder_path}")
+            
+            return folder_info
+        
+        # Get all top-level folders
         for folder_path in device_path.iterdir():
             if folder_path.is_dir():
-                files = file_model.get_files_by_device(device, folder_path.name)
-                total_size = sum(f.get('size', 0) for f in files)
-                
-                folders.append({
-                    'name': folder_path.name,
-                    'file_count': len(files),
-                    'total_size': total_size,
-                    'last_modified': max([f.get('modified_at') for f in files], default=None)
-                })
+                folder_info = get_folder_info(folder_path)
+                folders.append(folder_info)
         
         audit_model.log_action('list_folders', device, None, None, request.remote_addr)
         
@@ -90,53 +127,220 @@ def list_folders(device):
         current_app.logger.error(f"Error listing folders for {device}: {str(e)}")
         return jsonify({'error': 'Failed to list folders'}), 500
 
-@api_bp.route('/devices/<device>/folders/<folder>/files')
-@require_auth
-def list_files(device, folder):
-    """List files in a specific device folder"""
+@api_bp.route('/devices/<device>/folders/<path:folder_path>')
+def list_folder_contents(device, folder_path):
+    """List contents of a specific folder (including nested paths)"""
     try:
         device = validate_device_type(device)
-        folder = sanitize_path(folder)
         file_model, audit_model = get_models()
         
-        files = file_model.get_files_by_device(device, folder)
+        # Validate the folder path more carefully
+        path_components = folder_path.split('/')
+        sanitized_components = []
         
-        # Convert MongoDB documents to JSON-serializable format
-        file_list = []
-        for file_doc in files:
-            file_info = {
-                'filename': file_doc['filename'],
-                'size': file_doc['size'],
-                'mime_type': file_doc.get('mime_type'),
-                'created_at': file_doc['created_at'].isoformat(),
-                'modified_at': file_doc['modified_at'].isoformat(),
-                'sha256': file_doc.get('sha256'),
-                'tags': file_doc.get('tags', []),
-                'version': file_doc.get('version', 1)
-            }
-            file_list.append(file_info)
+        for component in path_components:
+            if not component or component in ['.', '..']:
+                return jsonify({'error': 'Invalid folder path'}), 400
+            # Use basic validation instead of secure_filename for paths
+            if any(char in component for char in ['<', '>', ':', '"', '|', '?', '*']):
+                return jsonify({'error': 'Invalid characters in folder path'}), 400
+            sanitized_components.append(component)
         
-        audit_model.log_action('list_files', device, folder, None, request.remote_addr)
+        # Reconstruct the path
+        clean_folder_path = '/'.join(sanitized_components)
+        actual_folder_path = current_app.config['BACKUP_BASE_DIR'] / device / clean_folder_path
         
-        return jsonify({
+        if not actual_folder_path.exists() or not actual_folder_path.is_dir():
+            return jsonify({'error': 'Folder not found'}), 404
+        
+        # Check if path is within allowed directory (security)
+        try:
+            actual_folder_path.resolve().relative_to(
+                current_app.config['BACKUP_BASE_DIR'].resolve()
+            )
+        except ValueError:
+            return jsonify({'error': 'Invalid folder path'}), 400
+        
+        contents = {
             'device': device,
-            'folder': folder,
-            'files': file_list,
-            'total_files': len(file_list)
-        })
+            'folder_path': clean_folder_path,
+            'folders': [],
+            'files': [],
+            'breadcrumb': clean_folder_path.split('/'),
+            'parent_path': '/'.join(clean_folder_path.split('/')[:-1]) if '/' in clean_folder_path else None
+        }
+        
+        # List directory contents
+        try:
+            for item in actual_folder_path.iterdir():
+                if item.is_file() and not item.name.startswith('.'):
+                    # Get file info from database if available
+                    db_file = file_model.get_file_by_path(device, clean_folder_path, item.name)
+                    
+                    if db_file:
+                        file_info = {
+                            'filename': db_file['filename'],
+                            'size': db_file['size'],
+                            'mime_type': db_file.get('mime_type'),
+                            'created_at': db_file['created_at'].isoformat(),
+                            'modified_at': db_file['modified_at'].isoformat(),
+                            'sha256': db_file.get('sha256'),
+                            'tags': db_file.get('tags', []),
+                            'version': db_file.get('version', 1)
+                        }
+                    else:
+                        # File not in database, get basic info
+                        stat = item.stat()
+                        file_info = {
+                            'filename': item.name,
+                            'size': stat.st_size,
+                            'mime_type': file_model.get_mime_type(item.name),
+                            'created_at': datetime.fromtimestamp(stat.st_ctime).isoformat(),
+                            'modified_at': datetime.fromtimestamp(stat.st_mtime).isoformat(),
+                            'sha256': None,
+                            'tags': [],
+                            'version': 1,
+                            'in_database': False
+                        }
+                    
+                    contents['files'].append(file_info)
+                    
+                elif item.is_dir():
+                    # Get folder info
+                    try:
+                        stat = item.stat()
+                        # Count files in subfolder
+                        file_count = 0
+                        total_size = 0
+                        
+                        for subitem in item.iterdir():
+                            if subitem.is_file() and not subitem.name.startswith('.'):
+                                file_count += 1
+                                try:
+                                    total_size += subitem.stat().st_size
+                                except (OSError, PermissionError):
+                                    pass  # Skip files we can't access
+                        
+                        folder_info = {
+                            'name': item.name,
+                            'path': f"{clean_folder_path}/{item.name}",
+                            'file_count': file_count,
+                            'total_size': total_size,
+                            'last_modified': datetime.fromtimestamp(stat.st_mtime).isoformat()
+                        }
+                        contents['folders'].append(folder_info)
+                    except (OSError, PermissionError):
+                        current_app.logger.warning(f"Cannot access folder: {item}")
+                        continue
+        
+        except PermissionError:
+            return jsonify({'error': 'Permission denied accessing folder'}), 403
+        
+        # Sort contents
+        contents['folders'].sort(key=lambda x: x['name'])
+        contents['files'].sort(key=lambda x: x['filename'])
+        
+        audit_model.log_action('list_folder_contents', device, clean_folder_path, None, request.remote_addr)
+        
+        return jsonify(contents)
         
     except ValueError as e:
         return jsonify({'error': str(e)}), 400
     except Exception as e:
-        current_app.logger.error(f"Error listing files in {device}/{folder}: {str(e)}")
-        return jsonify({'error': 'Failed to list files'}), 500
+        current_app.logger.error(f"Error listing folder contents {device}/{folder_path}: {str(e)}")
+        return jsonify({'error': 'Failed to list folder contents'}), 500
+
+@api_bp.route('/devices/<device>/folders/<path:folder_path>/files', methods=['POST'])
+@limiter.limit("20 per minute")
+def upload_file_nested(device, folder_path):
+    """Upload a file to a nested folder path"""
+    filename = None
+    try:
+        device = validate_device_type(device)
+        file_model, audit_model = get_models()
+        
+        if 'file' not in request.files:
+            return jsonify({'error': 'No file provided'}), 400
+        
+        file = request.files['file']
+        if file.filename == '':
+            return jsonify({'error': 'No file selected'}), 400
+        
+        filename = validate_filename(file.filename)
+        
+        # Validate and clean the folder path
+        path_components = folder_path.split('/')
+        for component in path_components:
+            if not component or component in ['.', '..']:
+                return jsonify({'error': 'Invalid folder path'}), 400
+            if any(char in component for char in ['<', '>', ':', '"', '|', '?', '*']):
+                return jsonify({'error': 'Invalid characters in folder path'}), 400
+        
+        clean_folder_path = '/'.join(path_components)
+        
+        # Create nested folder structure if it doesn't exist
+        actual_folder_path = current_app.config['BACKUP_BASE_DIR'] / device / clean_folder_path
+        actual_folder_path.mkdir(parents=True, exist_ok=True)
+        
+        filepath = actual_folder_path / filename
+        
+        # Check if file already exists in database
+        existing_file = file_model.get_file_by_path(device, clean_folder_path, filename)
+        if existing_file:
+            return jsonify({'error': 'File already exists'}), 409
+        
+        # Save file
+        file.save(str(filepath))
+        
+        # Create database record
+        metadata = {
+            'client_ip': request.remote_addr,
+            'source': 'api_upload',
+            'tags': request.form.getlist('tags')
+        }
+        
+        file_id = file_model.create_file_record(device, clean_folder_path, filename, filepath, metadata)
+        
+        # Get the created file record for response
+        file_record = file_model.get_file_by_path(device, clean_folder_path, filename)
+        
+        audit_model.log_action('upload', device, clean_folder_path, filename, request.remote_addr, True, {
+            'file_id': file_id,
+            'file_size': file_record['size'],
+            'nested_path': clean_folder_path
+        })
+        
+        return jsonify({
+            'message': 'File uploaded successfully',
+            'file_id': file_id,
+            'file': {
+                'filename': filename,
+                'size': file_record['size'],
+                'sha256': file_record['sha256'],
+                'mime_type': file_record['mime_type'],
+                'created_at': file_record['created_at'].isoformat(),
+                'folder_path': clean_folder_path
+            }
+        }), 201
+        
+    except ValueError as e:
+        filename_safe = filename if filename else 'unknown'
+        if 'audit_model' in locals():
+            audit_model.log_action('upload', device, folder_path, filename_safe, request.remote_addr, False, {'error': str(e)})
+        return jsonify({'error': str(e)}), 400
+    except RequestEntityTooLarge:
+        return jsonify({'error': 'File too large'}), 413
+    except Exception as e:
+        filename_safe = filename if filename else 'unknown'
+        if 'audit_model' in locals():
+            audit_model.log_action('upload', device, folder_path, filename_safe, request.remote_addr, False, {'error': str(e)})
+        return jsonify({'error': 'Upload failed'}), 500
 
 @api_bp.route('/devices/<device>/folders/<folder>/files', methods=['POST'])
-@require_auth
-@limiter.limit("10 per minute")
+@limiter.limit("20 per minute")
 def upload_file(device, folder):
     """Upload a file to specified device folder"""
-    filename = None  # Initialize filename variable
+    filename = None
     try:
         device = validate_device_type(device)
         folder = sanitize_path(folder)
@@ -169,7 +373,7 @@ def upload_file(device, folder):
         metadata = {
             'client_ip': request.remote_addr,
             'source': 'api_upload',
-            'tags': request.form.getlist('tags')  # Optional tags from form
+            'tags': request.form.getlist('tags')
         }
         
         file_id = file_model.create_file_record(device, folder, filename, filepath, metadata)
@@ -181,8 +385,6 @@ def upload_file(device, folder):
             'file_id': file_id,
             'file_size': file_record['size']
         })
-        
-        current_app.logger.info(f"File uploaded: {device}/{folder}/{filename}")
         
         return jsonify({
             'message': 'File uploaded successfully',
@@ -198,326 +400,122 @@ def upload_file(device, folder):
         
     except ValueError as e:
         filename_safe = filename if filename else 'unknown'
-        audit_model.log_action('upload', device, folder, filename_safe, request.remote_addr, False, {'error': str(e)})
+        if 'audit_model' in locals():
+            audit_model.log_action('upload', device, folder, filename_safe, request.remote_addr, False, {'error': str(e)})
         return jsonify({'error': str(e)}), 400
     except RequestEntityTooLarge:
         return jsonify({'error': 'File too large'}), 413
     except Exception as e:
         filename_safe = filename if filename else 'unknown'
-        current_app.logger.error(f"Error uploading file: {str(e)}")
-        audit_model.log_action('upload', device, folder, filename_safe, request.remote_addr, False, {'error': str(e)})
+        if 'audit_model' in locals():
+            audit_model.log_action('upload', device, folder, filename_safe, request.remote_addr, False, {'error': str(e)})
         return jsonify({'error': 'Upload failed'}), 500
 
-@api_bp.route('/devices/<device>/folders/<folder>/files/<filename>')
-@require_auth
-def download_file(device, folder, filename):
-    """Download a specific file"""
-    try:
-        device = validate_device_type(device)
-        folder = sanitize_path(folder)
-        filename = sanitize_path(filename)
-        file_model, audit_model = get_models()
-        
-        # Check if file exists in database
-        file_record = file_model.get_file_by_path(device, folder, filename)
-        if not file_record:
-            return jsonify({'error': 'File not found in database'}), 404
-        
-        filepath = Path(file_record['file_path'])
-        
-        if not filepath.exists():
-            current_app.logger.warning(f"File exists in DB but not on disk: {filepath}")
-            return jsonify({'error': 'File not found on disk'}), 404
-        
-        audit_model.log_action('download', device, folder, filename, request.remote_addr)
-        
-        return send_file(str(filepath), as_attachment=True)
-        
-    except ValueError as e:
-        return jsonify({'error': str(e)}), 400
-    except Exception as e:
-        current_app.logger.error(f"Error downloading file {device}/{folder}/{filename}: {str(e)}")
-        return jsonify({'error': 'Download failed'}), 500
+@api_bp.route('/health')
+def health_check():
+    """Health check endpoint"""
+    return jsonify({
+        'status': 'healthy',
+        'timestamp': datetime.utcnow().isoformat(),
+        'server': 'local-file-server'
+    })
 
-@api_bp.route('/devices/<device>/folders/<folder>/files/<filename>', methods=['DELETE'])
-@require_auth
-def delete_file(device, folder, filename):
-    """Delete a specific file"""
+@api_bp.route('/devices/<device>/folders/<path:folder_path>/files/<filename>', methods=['GET'])
+def download_file_nested(device, folder_path, filename):
+    """Download or view a file from nested folder path"""
     try:
         device = validate_device_type(device)
-        folder = sanitize_path(folder)
-        filename = sanitize_path(filename)
-        file_model, audit_model = get_models()
         
-        # Check if file exists in database
-        file_record = file_model.get_file_by_path(device, folder, filename)
-        if not file_record:
+        # Validate and clean the folder path
+        path_components = folder_path.split('/')
+        sanitized_components = []
+        
+        for component in path_components:
+            if not component or component.strip() == '':
+                continue  # Skip empty components
+            if component in ['.', '..']:
+                return jsonify({'error': 'Invalid folder path'}), 400
+            if any(char in component for char in ['<', '>', ':', '"', '|', '?', '*']):
+                return jsonify({'error': 'Invalid characters in folder path'}), 400
+            sanitized_components.append(component.strip())
+        
+        if not sanitized_components:
+            return jsonify({'error': 'Invalid folder path'}), 400
+        
+        clean_folder_path = '/'.join(sanitized_components)
+        
+        # Define actual_folder_path before using it
+        actual_folder_path = current_app.config['BACKUP_BASE_DIR'] / device / clean_folder_path
+        
+        # Check if folder exists
+        if not actual_folder_path.exists() or not actual_folder_path.is_dir():
+            return jsonify({'error': 'Folder not found'}), 404
+        
+        # Find the actual filename on disk
+        from app.utils.security import find_actual_filename
+        actual_filename = find_actual_filename(str(actual_folder_path), filename)
+        
+        if not actual_filename:
             return jsonify({'error': 'File not found'}), 404
         
-        # Remove physical file
-        filepath = Path(file_record['file_path'])
-        if filepath.exists():
-            filepath.unlink()
+        filepath = actual_folder_path / actual_filename
         
-        # Mark as deleted in database (soft delete)
-        file_model.mark_file_deleted(device, folder, filename)
+        # Security check - ensure file is within allowed directory
+        try:
+            filepath.resolve().relative_to(current_app.config['BACKUP_BASE_DIR'].resolve())
+        except ValueError:
+            return jsonify({'error': 'Invalid file path'}), 400
         
-        audit_model.log_action('delete', device, folder, filename, request.remote_addr)
-        
-        current_app.logger.info(f"File deleted: {device}/{folder}/{filename}")
-        
-        return jsonify({'message': 'File deleted successfully'})
+        # Serve the file
+        return send_file(
+            str(filepath),
+            as_attachment=request.args.get('download', 'false').lower() == 'true',
+            download_name=actual_filename
+        )
         
     except ValueError as e:
         return jsonify({'error': str(e)}), 400
     except Exception as e:
-        current_app.logger.error(f"Error deleting file {device}/{folder}/{filename}: {str(e)}")
-        return jsonify({'error': 'Delete failed'}), 500
+        current_app.logger.error(f"Error serving file {device}/{folder_path}/{filename}: {str(e)}")
+        return jsonify({'error': 'Failed to serve file'}), 500
 
-@api_bp.route('/devices/<device>/folders', methods=['POST'])
-@require_auth
-def create_folder(device):
-    """Create a new folder"""
-    folder = None  # Initialize folder variable
+@api_bp.route('/devices/<device>/folders/<folder>/files/<filename>', methods=['GET'])
+def download_file_simple(device, folder, filename):
+    """Download or view a file from simple folder path"""
     try:
         device = validate_device_type(device)
-        audit_model = get_models()[1]
+        folder = sanitize_path(folder)
         
-        data = request.get_json()
-        if not data or 'folder_name' not in data:
-            return jsonify({'error': 'folder_name required in request body'}), 400
-        
-        folder = sanitize_path(data['folder_name'])
-        
+        # Find the actual filename on disk
+        from app.utils.security import find_actual_filename
         folder_path = current_app.config['BACKUP_BASE_DIR'] / device / folder
         
-        if folder_path.exists():
-            return jsonify({'error': 'Folder already exists'}), 409
+        # Convert Path to string for find_actual_filename
+        actual_filename = find_actual_filename(str(folder_path), filename)
         
-        folder_path.mkdir(parents=True, exist_ok=True)
-        
-        audit_model.log_action('create_folder', device, folder, '', request.remote_addr)
-        
-        current_app.logger.info(f"Folder created: {device}/{folder}")
-        
-        return jsonify({
-            'message': 'Folder created successfully',
-            'path': f"{device}/{folder}"
-        }), 201
-        
-    except ValueError as e:
-        return jsonify({'error': str(e)}), 400
-    except Exception as e:
-        folder_name = folder if folder else 'unknown'
-        current_app.logger.error(f"Error creating folder {device}/{folder_name}: {str(e)}")
-        return jsonify({'error': 'Failed to create folder'}), 500
-
-@api_bp.route('/devices/<device>/folders/<folder>/files/<filename>/checksum')
-@require_auth
-def get_checksum(device, folder, filename):
-    """Get file checksum for integrity verification"""
-    try:
-        device = validate_device_type(device)
-        folder = sanitize_path(folder)
-        filename = sanitize_path(filename)
-        file_model = get_models()[0]
-        
-        file_record = file_model.get_file_by_path(device, folder, filename)
-        if not file_record:
+        if not actual_filename:
             return jsonify({'error': 'File not found'}), 404
         
-        algorithm = request.args.get('algorithm', 'sha256').lower()
-        if algorithm not in ['md5', 'sha256']:
-            return jsonify({'error': 'Invalid algorithm. Use md5 or sha256'}), 400
+        filepath = folder_path / actual_filename
         
-        checksum = file_record.get(algorithm)
-        if not checksum:
-            return jsonify({'error': f'{algorithm} checksum not available'}), 404
+        # Security check
+        try:
+            filepath.resolve().relative_to(current_app.config['BACKUP_BASE_DIR'].resolve())
+        except ValueError:
+            return jsonify({'error': 'Invalid file path'}), 400
         
-        return jsonify({
-            'filename': filename,
-            'algorithm': algorithm,
-            'checksum': checksum,
-            'size': file_record['size']
-        })
-        
-    except ValueError as e:
-        return jsonify({'error': str(e)}), 400
-    except Exception as e:
-        current_app.logger.error(f"Error getting checksum: {str(e)}")
-        return jsonify({'error': 'Checksum retrieval failed'}), 500
-
-@api_bp.route('/devices/<device>/folders/<folder>/files/<filename>/verify', methods=['POST'])
-@require_auth
-def verify_file(device, folder, filename):
-    """Verify file integrity against provided checksum"""
-    try:
-        device = validate_device_type(device)
-        folder = sanitize_path(folder)
-        filename = sanitize_path(filename)
-        file_model = get_models()[0]
-        
-        data = request.get_json()
-        if not data or 'checksum' not in data:
-            return jsonify({'error': 'Checksum required in request body'}), 400
-        
-        expected_checksum = data['checksum']
-        algorithm = data.get('algorithm', 'sha256').lower()
-        
-        if algorithm not in ['md5', 'sha256']:
-            return jsonify({'error': 'Invalid algorithm. Use md5 or sha256'}), 400
-        
-        result = file_model.verify_file_integrity(device, folder, filename, expected_checksum, algorithm)
-        
-        return jsonify({
-            'filename': filename,
-            'algorithm': algorithm,
-            'verification_result': result
-        })
+        # Serve the file
+        return send_file(
+            str(filepath),
+            as_attachment=request.args.get('download', 'false').lower() == 'true',
+            download_name=actual_filename
+        )
         
     except ValueError as e:
         return jsonify({'error': str(e)}), 400
     except Exception as e:
-        current_app.logger.error(f"Error verifying file: {str(e)}")
-        return jsonify({'error': 'Verification failed'}), 500
-
-@api_bp.route('/search')
-@require_auth
-def search_files():
-    """Search files across all devices or specific device/folder"""
-    try:
-        query = request.args.get('q', '').strip()
-        if not query:
-            return jsonify({'error': 'Search query (q) is required'}), 400
-        
-        device = request.args.get('device')
-        folder = request.args.get('folder')
-        limit = min(int(request.args.get('limit', 50)), 100)  # Max 100 results
-        
-        if device:
-            device = validate_device_type(device)
-        if folder:
-            folder = sanitize_path(folder)
-        
-        file_model, audit_model = get_models()
-        
-        results = file_model.search_files(query, device, folder, limit)
-        
-        # Convert to JSON-serializable format
-        search_results = []
-        for file_doc in results:
-            search_results.append({
-                'device': file_doc['device'],
-                'folder': file_doc['folder'],
-                'filename': file_doc['filename'],
-                'size': file_doc['size'],
-                'mime_type': file_doc.get('mime_type'),
-                'created_at': file_doc['created_at'].isoformat(),
-                'tags': file_doc.get('tags', [])
-            })
-        
-        audit_model.log_action('search', device, folder, None, request.remote_addr, True, {
-            'query': query,
-            'results_count': len(search_results)
-        })
-        
-        return jsonify({
-            'query': query,
-            'results': search_results,
-            'total_results': len(search_results),
-            'search_filters': {
-                'device': device,
-                'folder': folder,
-                'limit': limit
-            }
-        })
-        
-    except ValueError as e:
-        return jsonify({'error': str(e)}), 400
-    except Exception as e:
-        current_app.logger.error(f"Error searching files: {str(e)}")
-        return jsonify({'error': 'Search failed'}), 500
-
-@api_bp.route('/audit/logs')
-@require_auth
-def get_audit_logs():
-    """Get recent audit log entries"""
-    try:
-        limit = min(int(request.args.get('limit', 100)), 500)  # Max 500 entries
-        device = request.args.get('device')
-        action = request.args.get('action')
-        
-        if device:
-            device = validate_device_type(device)
-        
-        audit_model = get_models()[1]
-        logs = audit_model.get_recent_actions(limit, device, action)
-        
-        # Convert to JSON-serializable format
-        log_entries = []
-        for log in logs:
-            log_entries.append({
-                'timestamp': log['timestamp'].isoformat(),
-                'action': log['action'],
-                'device': log['device'],
-                'folder': log['folder'],
-                'filename': log['filename'],
-                'client_ip': log['client_ip'],
-                'success': log['success'],
-                'details': log.get('details', {})
-            })
-        
-        return jsonify({
-            'logs': log_entries,
-            'total_entries': len(log_entries),
-            'filters': {
-                'device': device,
-                'action': action,
-                'limit': limit
-            }
-        })
-        
-    except ValueError as e:
-        return jsonify({'error': str(e)}), 400
-    except Exception as e:
-        current_app.logger.error(f"Error retrieving audit logs: {str(e)}")
-        return jsonify({'error': 'Failed to retrieve audit logs'}), 500
-
-@api_bp.route('/stats')
-@require_auth
-def get_statistics():
-    """Get comprehensive backup statistics"""
-    try:
-        file_model, audit_model = get_models()
-        
-        # Get device statistics
-        device_stats = {}
-        total_files = 0
-        total_size = 0
-        
-        for device in ['laptop', 'mobile', 'server']:
-            stats = file_model.get_device_stats(device)
-            device_stats[device] = stats
-            total_files += stats.get('total_files', 0)
-            total_size += stats.get('total_size', 0)
-        
-        # Get recent activity stats (last 7 days)
-        activity_stats = audit_model.get_action_stats(days=7)
-        
-        return jsonify({
-            'overview': {
-                'total_files': total_files,
-                'total_size': total_size,
-                'total_size_gb': round(total_size / (1024**3), 2)
-            },
-            'by_device': device_stats,
-            'recent_activity': activity_stats,
-            'generated_at': datetime.utcnow().isoformat()
-        })
-        
-    except Exception as e:
-        current_app.logger.error(f"Error generating statistics: {str(e)}")
-        return jsonify({'error': 'Failed to generate statistics'}), 500
+        current_app.logger.error(f"Error serving file {device}/{folder}/{filename}: {str(e)}")
+        return jsonify({'error': 'Failed to serve file'}), 500
 
 # Error handlers
 @api_bp.errorhandler(404)

@@ -5,7 +5,7 @@ class Config:
     """Base configuration"""
     SECRET_KEY = os.environ.get('SECRET_KEY') or 'dev-key-change-in-production'
     MONGODB_URI = os.environ.get('MONGODB_URI') or 'mongodb://localhost:27017/backup_db'
-    BACKUP_BASE_DIR = Path(os.environ.get('BACKUP_BASE_DIR', '/mnt/backupdrive/backups'))
+    BACKUP_BASE_DIR = Path(os.environ.get('BACKUP_BASE_DIR', '/Users/ericmwirichia/Desktop/backups'))
     AUTH_TOKEN = os.environ.get('BACKUP_API_TOKEN', 'backup-secret-key-change-me')
     MAX_CONTENT_LENGTH = 500 * 1024 * 1024  # 500MB
     

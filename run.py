@@ -41,7 +41,7 @@ def main():
     
     # Get configuration
     debug_mode = os.environ.get('FLASK_ENV') == 'development'
-    port = int(os.environ.get('PORT', 5000))
+    port = int(os.environ.get('PORT', 5001))
     host = os.environ.get('HOST', '0.0.0.0')
     
     print(f"📊 Configuration:")
@@ -49,7 +49,7 @@ def main():
     print(f"   - Port: {port}")
     print(f"   - Debug: {debug_mode}")
     print(f"   - Backup directory: {app.config['BACKUP_BASE_DIR']}")
-    print(f"   - MongoDB: {'Connected' if app.db else 'Not connected'}")
+    print(f"   - MongoDB: {'Connected' if app.db is not None else 'Not connected'}")
     print(f"\n🌐 API will be available at: http://{host}:{port}")
     print(f"🔍 Health check: http://{host}:{port}/health")
     print(f"📚 API docs: http://{host}:{port}/api/v1/devices")
